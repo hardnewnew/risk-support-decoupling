@@ -1,9 +1,10 @@
-"""Candidate reference implementation; not yet verified as identical to the implementation used for the reported results."""
+"""Reference implementation following the method specification of the accompanying paper; see README for scope."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Any
+from math import isfinite, log1p
 
 import pandas as pd
 
@@ -28,7 +29,9 @@ def validate_aggregates(data: pd.DataFrame) -> pd.DataFrame:
     normalized["sample_count"] = pd.to_numeric(normalized["sample_count"], errors="raise")
     normalized["failure_count"] = pd.to_numeric(normalized["failure_count"], errors="raise")
     invalid = (
-        (normalized["sample_count"] < 0)
+        ~normalized["sample_count"].map(isfinite)
+        | ~normalized["failure_count"].map(isfinite)
+        | (normalized["sample_count"] < 0)
         | (normalized["failure_count"] < 0)
         | (normalized["failure_count"] > normalized["sample_count"])
     )
@@ -53,6 +56,7 @@ def aggregate_counts(
     cutoff_month: Any,
     *,
     window_months: int | None = None,
+    start_month: Any | None = None,
     key_columns: Sequence[str] | None = None,
     key_values: Sequence[Any] | None = None,
 ) -> tuple[float, float]:
@@ -60,6 +64,8 @@ def aggregate_counts(
 
     history = restrict_to_cutoff(data, cutoff_month)
     cutoff = as_month(cutoff_month)
+    if start_month is not None:
+        history = history.loc[history["month"] >= as_month(start_month)]
     if window_months is not None:
         if int(window_months) <= 0:
             raise ValueError("window_months must be positive.")
@@ -76,15 +82,32 @@ def aggregate_counts(
     return float(history["sample_count"].sum()), float(history["failure_count"].sum())
 
 
-def empirical_prior(data: pd.DataFrame, cutoff_month: Any, default_prior: float) -> float:
-    """Estimate the candidate global through-cutoff empirical prior."""
+def empirical_prior(
+    data: pd.DataFrame,
+    cutoff_month: Any,
+    default_prior: float,
+    prior_start_month: Any = "2024-01",
+) -> float:
+    """Estimate the global prior from the inclusive configured prior interval."""
 
-    samples, failures = aggregate_counts(data, cutoff_month)
-    if samples == 0:
+    history = restrict_to_cutoff(data, cutoff_month)
+    history = history.loc[history["month"] >= as_month(prior_start_month)]
+    if history.empty:
         if not 0.0 <= float(default_prior) <= 1.0:
             raise ValueError("default_prior must lie in [0, 1].")
         return float(default_prior)
+    samples, failures = aggregate_counts(history, cutoff_month)
+    if samples == 0:
+        raise ValueError("The prior interval contains records but no samples; its rate is undefined.")
     return failures / samples
+
+
+def log_saturated_support(n: float, n_max: float) -> float:
+    """Compute Eq. (10), clipped to the unit interval."""
+
+    if not isfinite(n) or not isfinite(n_max) or n < 0 or n_max <= 0:
+        raise ValueError("n must be nonnegative and n_max must be positive and finite.")
+    return float(min(1.0, max(0.0, log1p(n) / log1p(n_max))))
 
 
 def beta_rate(failures: float, samples: float, prior_mean: float, prior_strength: float) -> float:

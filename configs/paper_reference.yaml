@@ -1,0 +1,43 @@
+# Default method configuration. No datasets are distributed.
+prior_strength_a: 100
+support_saturation_n_max: 150
+prior_start_month: "2024-01"
+local_history_start_month: "2024-07"
+training_start_month: "2024-07"
+latency_months: 0
+# Used only when the prior interval contains no records.
+default_prior: 0.0
+learner: system_lightgbm
+# The paper does not fix the random seed.
+random_state: 0
+min_training_rows: 1
+fallback_score_column: historical_smoothed_rate
+numeric_features:
+  - historical_smoothed_rate
+  - rolling_two_month_smoothed_rate
+  - rolling_quarter_smoothed_rate
+  - log_saturated_support
+  - cumulative_sample_count
+  - rolling_quarter_sample_count
+  - month_of_year
+categorical_features: [broad_category, sampling_stage]
+score_smoothing: {enabled: false, alpha: 0.6}
+tie_breaking:
+  - {column: smoothed_score, ascending: false}
+  - {column: risk_unit_id, ascending: true}
+missing_category_token: "__missing__"
+hierarchy_levels:
+  - [broad_category, sampling_stage, tested_item]
+  - [broad_category, category, sampling_stage]
+  - [broad_category, sampling_stage]
+  - [broad_category]
+rolling_two_months: 2
+rolling_quarter_months: 3
+# The group-source window is not fixed by the paper; null uses all local history.
+group_backoff_window_months: null
+include_extra_fields: false
+method_status: reference_implementation_following_paper_specification
+
+# GBM-11 ablation: set include_extra_fields: true; append level_0_rate and
+# adaptive_hierarchy_score to numeric_features; set learner: gbm9_sklearn,
+# min_training_rows: 20, and fallback_score_column: adaptive_hierarchy_score.

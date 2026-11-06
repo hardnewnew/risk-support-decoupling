@@ -1,4 +1,4 @@
-"""Candidate reference implementation; not yet verified as identical to the implementation used for the reported results."""
+"""Reference implementation following the method specification of the accompanying paper; see README for scope."""
 
 from __future__ import annotations
 
@@ -28,7 +28,12 @@ def smooth_scores(
     if current_months.nunique() != 1:
         raise ValueError("Current scores must contain exactly one decision month.")
     current_month = current_months.iloc[0]
-    alpha = float(config["alpha"])
+    settings = config.get("score_smoothing", {})
+    if not settings.get("enabled", False):
+        result["smoothed_score"] = pd.to_numeric(result["raw_score"], errors="raise").astype(float)
+        result["smoothing_mode"] = "disabled"
+        return result
+    alpha = float(settings.get("alpha", 0.6))
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("alpha must lie in [0, 1].")
 

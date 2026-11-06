@@ -1,4 +1,4 @@
-"""Candidate reference implementation; not yet verified as identical to the implementation used for the reported results."""
+"""Reference implementation following the method specification of the accompanying paper; see README for scope."""
 
 from __future__ import annotations
 
@@ -20,7 +20,11 @@ def rank_and_select(
         raise ValueError("Scores require risk_unit_id.")
     if scores["risk_unit_id"].isna().any() or scores["risk_unit_id"].duplicated().any():
         raise ValueError("Scores require one nonmissing row per risk_unit_id.")
-    tie_rules = list(config["tie_breaking"])
+    score_column = "smoothed_score" if "smoothed_score" in scores.columns else "raw_score"
+    tie_rules = list(config.get("tie_breaking", [
+        {"column": score_column, "ascending": False},
+        {"column": "risk_unit_id", "ascending": True},
+    ]))
     columns = [str(rule["column"]) for rule in tie_rules]
     ascending = [bool(rule["ascending"]) for rule in tie_rules]
     missing = sorted(set(columns).difference(scores.columns))

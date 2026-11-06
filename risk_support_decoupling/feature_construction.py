@@ -1,4 +1,4 @@
-"""Candidate reference implementation; not yet verified as identical to the implementation used for the reported results."""
+"""Reference implementation following the method specification of the accompanying paper; see README for scope."""
 
 from __future__ import annotations
 
@@ -7,29 +7,31 @@ from typing import Any
 
 import pandas as pd
 
-from .evidence_rates import aggregate_counts, as_month, beta_rate, empirical_prior, restrict_to_cutoff, validate_aggregates
+from .config_loader import CATEGORICAL_FEATURES, NUMERIC_FEATURES, UNIT_COLUMNS, latency_months
+from .evidence_rates import (
+    aggregate_counts, as_month, beta_rate, empirical_prior,
+    log_saturated_support, restrict_to_cutoff, validate_aggregates,
+)
 from .hierarchy import adaptive_hierarchy_score
 
 
 def _normalize_input(data: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
-    """Validate unit identifiers and normalize configured categorical keys."""
+    """Require the monthly schema and one string identifier per four-field unit."""
 
+    required = {"risk_unit_id", *UNIT_COLUMNS}
+    missing = sorted(required.difference(data.columns))
+    if missing:
+        raise ValueError(f"Aggregate data are missing required columns: {missing}")
     normalized = validate_aggregates(data)
-    if "risk_unit_id" not in normalized.columns:
-        raise ValueError("Aggregate data require risk_unit_id.")
     if normalized["risk_unit_id"].isna().any():
         raise ValueError("risk_unit_id cannot be missing.")
     normalized["risk_unit_id"] = normalized["risk_unit_id"].astype(str)
     token = str(config["missing_category_token"])
-    configured_columns = {
-        column
-        for level in config["hierarchy_levels"]
-        for column in level
-    }.union(config["categorical_features"])
-    for column in sorted(configured_columns):
-        if column not in normalized.columns:
-            normalized[column] = token
+    for column in UNIT_COLUMNS:
         normalized[column] = normalized[column].where(normalized[column].notna(), token).astype(str)
+    units = normalized[["risk_unit_id", *UNIT_COLUMNS]].drop_duplicates()
+    if units["risk_unit_id"].duplicated().any() or units.duplicated(UNIT_COLUMNS).any():
+        raise ValueError("risk_unit_id must map one-to-one to the four-field risk unit.")
     return normalized
 
 
@@ -38,35 +40,24 @@ def _candidate_table(
     config: dict[str, Any],
     candidates: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    """Build one deterministic candidate row per unit from cutoff-available attributes."""
+    """Retain one cutoff-available row per unit; explicit pools remain supported."""
 
-    token = str(config["missing_category_token"])
-    attribute_columns = sorted(
-        {
-            column
-            for level in config["hierarchy_levels"]
-            for column in level
-        }.union(config["categorical_features"])
-        - {"risk_unit_id"}
-    )
+    columns = ["risk_unit_id", *UNIT_COLUMNS]
     if candidates is None:
-        if history.empty:
-            return pd.DataFrame(columns=["risk_unit_id", *attribute_columns])
         ordered = history.sort_values(["month", "risk_unit_id"], kind="mergesort")
-        result = ordered.drop_duplicates("risk_unit_id", keep="last")
-        return result[["risk_unit_id", *attribute_columns]].reset_index(drop=True)
-
+        return ordered.drop_duplicates("risk_unit_id", keep="last")[columns].reset_index(drop=True)
     if "risk_unit_id" not in candidates.columns or candidates["risk_unit_id"].isna().any():
         raise ValueError("Explicit candidates require nonmissing risk_unit_id.")
     result = candidates.copy()
     result["risk_unit_id"] = result["risk_unit_id"].astype(str)
     if result["risk_unit_id"].duplicated().any():
         raise ValueError("Explicit candidates must be unique by risk_unit_id.")
-    for column in attribute_columns:
+    token = str(config["missing_category_token"])
+    for column in UNIT_COLUMNS:
         if column not in result.columns:
             result[column] = token
         result[column] = result[column].where(result[column].notna(), token).astype(str)
-    return result[["risk_unit_id", *attribute_columns]].reset_index(drop=True)
+    return result[columns].reset_index(drop=True)
 
 
 def construct_features_for_month(
@@ -76,58 +67,65 @@ def construct_features_for_month(
     *,
     candidates: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Construct the 11 proposed forward-safe features for one decision month."""
+    """Construct the nine Table 2 fields for one decision month."""
 
     normalized = _normalize_input(data, config)
-    cutoff = as_month(decision_month)
+    decision = as_month(decision_month)
+    cutoff = decision - latency_months(config)
     history = restrict_to_cutoff(normalized, cutoff)
-    if not history.empty and history["month"].max() > cutoff:
-        raise AssertionError("Feature history exceeds the decision month.")
     candidate_table = _candidate_table(history, config, candidates)
-    prior = empirical_prior(history, cutoff, float(config["default_prior"]))
-    m0 = float(config["m0"])
-    tau = float(config["tau"])
+    prior = empirical_prior(
+        normalized, cutoff, float(config["default_prior"]), config.get("prior_start_month", "2024-01")
+    )
+    start = as_month(config.get("local_history_start_month", "2024-07"))
+    strength = float(config["prior_strength_a"])
+    extra = bool(config.get("include_extra_fields", False))
+    audit_columns = ["risk_unit_id", "empirical_prior", "decision_month", "history_cutoff"]
+    extra_columns = [
+        "level_0_rate", "adaptive_hierarchy_score", "selected_hierarchy_level",
+        "selected_hierarchy_level_index", "selected_window_months",
+        "selected_support_count", "selected_failure_count",
+    ] if extra else []
+    columns = NUMERIC_FEATURES + CATEGORICAL_FEATURES + extra_columns + audit_columns
     rows: list[dict[str, Any]] = []
-
     for candidate in candidate_table.to_dict(orient="records"):
         unit_id = str(candidate["risk_unit_id"])
         unit_history = history.loc[history["risk_unit_id"] == unit_id]
-        cumulative_n, cumulative_f = aggregate_counts(unit_history, cutoff)
+        n, f = aggregate_counts(unit_history, cutoff, start_month=start)
         two_n, two_f = aggregate_counts(
-            unit_history, cutoff, window_months=int(config["rolling_two_months"])
+            unit_history, cutoff, start_month=start, window_months=int(config["rolling_two_months"])
         )
-        fixed_n, fixed_f = aggregate_counts(
-            unit_history, cutoff, window_months=int(config["fixed_window_months"])
+        quarter_n, quarter_f = aggregate_counts(
+            unit_history, cutoff, start_month=start, window_months=int(config["rolling_quarter_months"])
         )
-        quarter_n, _ = aggregate_counts(
-            unit_history, cutoff, window_months=int(config["rolling_quarter_months"])
-        )
-        hierarchy = adaptive_hierarchy_score(history, candidate, cutoff, config)
-        level_zero_rate = cumulative_f / cumulative_n if cumulative_n > 0 else prior
-        support_score = cumulative_n / (cumulative_n + tau) if cumulative_n > 0 else 0.0
         row = {
+            "historical_smoothed_rate": beta_rate(f, n, prior, strength),
+            "rolling_two_month_smoothed_rate": beta_rate(two_f, two_n, prior, strength),
+            "rolling_quarter_smoothed_rate": beta_rate(quarter_f, quarter_n, prior, strength),
+            "log_saturated_support": log_saturated_support(n, float(config["support_saturation_n_max"])),
+            "cumulative_sample_count": n,
+            "rolling_quarter_sample_count": quarter_n,
+            "month_of_year": int(decision.month),
+            "broad_category": candidate["broad_category"],
+            "sampling_stage": candidate["sampling_stage"],
             "risk_unit_id": unit_id,
-            "decision_month": str(cutoff),
-            "history_cutoff": str(cutoff),
-            "historical_smoothed_rate": beta_rate(cumulative_f, cumulative_n, prior, m0),
-            "rolling_two_month_beta_rate": beta_rate(two_f, two_n, prior, m0),
-            "fixed_window_beta_rate": beta_rate(fixed_f, fixed_n, prior, m0),
-            "level_0_rate": float(level_zero_rate),
-            "adaptive_hierarchy_score": hierarchy.score,
-            "support_score": float(support_score),
-            "cumulative_sample_count": float(cumulative_n),
-            "rolling_quarter_sample_count": float(quarter_n),
-            "month_of_year": int(cutoff.month),
-            "broad_category": candidate.get("broad_category", config["missing_category_token"]),
-            "sampling_stage": candidate.get("sampling_stage", config["missing_category_token"]),
-            "selected_hierarchy_level": hierarchy.selected_level,
-            "selected_hierarchy_level_index": hierarchy.selected_level_index,
-            "selected_window_months": hierarchy.selected_window_months,
-            "selected_support_count": hierarchy.support_count,
             "empirical_prior": prior,
+            "decision_month": str(decision),
+            "history_cutoff": str(cutoff),
         }
+        if extra:
+            hierarchy = adaptive_hierarchy_score(history, candidate, cutoff, config)
+            row.update({
+                "level_0_rate": f / n if n > 0 else prior,
+                "adaptive_hierarchy_score": hierarchy.score,
+                "selected_hierarchy_level": hierarchy.selected_level,
+                "selected_hierarchy_level_index": hierarchy.selected_level_index,
+                "selected_window_months": hierarchy.selected_window_months,
+                "selected_support_count": hierarchy.support_count,
+                "selected_failure_count": hierarchy.failure_count,
+            })
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_supervised_rows(
@@ -135,35 +133,33 @@ def build_supervised_rows(
     decision_months: Iterable[Any],
     config: dict[str, Any],
 ) -> pd.DataFrame:
-    """Build earlier decision rows with masked, next-month observed labels."""
+    """Rebuild each earlier cutoff and attach only observed next-month labels."""
 
     normalized = _normalize_input(data, config)
+    start = as_month(config.get("training_start_month", "2024-07"))
     panels: list[pd.DataFrame] = []
     for value in decision_months:
         decision = as_month(value)
-        target_month = decision + 1
+        if decision < start:
+            continue
         features = construct_features_for_month(normalized, decision, config)
         if features.empty:
             continue
+        target_month = decision + 1
         target = normalized.loc[normalized["month"] == target_month]
-        target_counts = (
-            target.groupby("risk_unit_id", as_index=False)[["sample_count", "failure_count"]].sum()
-            if not target.empty
-            else pd.DataFrame(columns=["risk_unit_id", "sample_count", "failure_count"])
-        )
-        target_map = target_counts.set_index("risk_unit_id").to_dict(orient="index")
-        observed: list[bool] = []
-        labels: list[float] = []
-        for unit_id in features["risk_unit_id"]:
-            counts = target_map.get(str(unit_id))
-            is_observed = bool(counts is not None and counts["sample_count"] > 0)
-            observed.append(is_observed)
-            labels.append(float(counts["failure_count"] > 0) if is_observed else float("nan"))
+        counts = target.groupby("risk_unit_id")[["sample_count", "failure_count"]].sum()
+        counts = counts.reindex(features["risk_unit_id"])
+        observed = counts["sample_count"].fillna(0).gt(0).to_numpy()
         features["target_month"] = str(target_month)
         features["target_observed"] = observed
-        features["target"] = labels
+        features["target"] = counts["failure_count"].gt(0).astype(float).where(observed).to_numpy()
         panels.append(features)
     if not panels:
-        return pd.DataFrame()
+        empty = construct_features_for_month(normalized.iloc[:0], start, config)
+        return empty.assign(
+            target_month=pd.Series(dtype=str),
+            target_observed=pd.Series(dtype=bool),
+            target=pd.Series(dtype=float),
+        )
     return pd.concat(panels, ignore_index=True)
 
