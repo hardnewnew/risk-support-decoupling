@@ -1,8 +1,8 @@
-# Risk–Support Decoupling: Core Method Reference Implementation
+# An Evidence-aware Decision-support Framework for Capacity-constrained Food Safety Testing under Selective Observation
 
 Selected core methodological components accompanying:
 
-**“Decoupling failure risk from sample support for capacity-constrained food safety testing under selective observation.”**
+**“An Evidence-aware Decision-support Framework for Capacity-constrained Food Safety Testing under Selective Observation.”**
 
 ## Release Scope and Policy
 
